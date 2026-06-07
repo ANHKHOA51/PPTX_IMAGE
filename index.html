@@ -244,119 +244,146 @@
                 let slideXmlStr = await zip.file(slidePath).async("string");
                 let slideDoc = parser.parseFromString(slideXmlStr, "application/xml");
 
-                // Tìm ảnh trong slide
-                let blipNodes = slideDoc.getElementsByTagNameNS("*", "blip");
-                if (blipNodes.length === 0) blipNodes = slideDoc.getElementsByTagName("a:blip");
+                // ==========================================
+                // BƯỚC 1: KIỂM TRA XEM SLIDE CÓ "ẢNH THẬT" KHÔNG
+                // ==========================================
+                let allBlips = slideDoc.getElementsByTagName("a:blip");
+                if (allBlips.length === 0) allBlips = slideDoc.getElementsByTagNameNS("*", "blip");
 
-                if (blipNodes.length === 0) {
+                let hasValidImage = false;
+                for (let i = 0; i < allBlips.length; i++) {
+                    let curr = allBlips[i];
+                    let isBackground = false;
+
+                    // Truy ngược lên xem ảnh này có bị nằm trong thẻ nền (<p:bg>) không
+                    while (curr) {
+                        if (curr.nodeName === "p:bg" || (curr.nodeName && curr.nodeName.includes(":bg"))) {
+                            isBackground = true;
+                            break;
+                        }
+                        curr = curr.parentNode;
+                    }
+
+                    // Nếu có ít nhất 1 ảnh KHÔNG PHẢI là ảnh nền, thì đánh dấu là Slide hợp lệ
+                    if (!isBackground) {
+                        hasValidImage = true;
+                        break;
+                    }
+                }
+
+               if (!hasValidImage) {
                     // ==========================================
-                    // LOGIC XÓA BỎ SLIDE TRỐNG TẬN GỐC (BẢN CẬP NHẬT)
+                    // BƯỚC 2A: KHÔNG CÓ ẢNH THẬT -> XÓA BỎ SLIDE TẬN GỐC (BẢN FIX TRIỆT ĐỂ)
                     // ==========================================
-
-                    // a. Tìm Relationship ID (rId) của slide này trong presentation.xml.rels
-                    let rels = presRelsDoc.getElementsByTagName("Relationship");
-                    if (rels.length === 0) rels = presRelsDoc.getElementsByTagNameNS("*", "Relationship");
-
+                    
+                    // a. Tìm Relationship ID (rId) và xóa khỏi presentation.xml.rels
+                    let rels = Array.from(presRelsDoc.getElementsByTagName("Relationship"));
+                    if (rels.length === 0) rels = Array.from(presRelsDoc.getElementsByTagNameNS("*", "Relationship"));
+                    
                     let rIdToRemove = null;
-                    for (let i = 0; i < rels.length; i++) {
-                        let target = rels[i].getAttribute("Target");
-                        // Dùng .includes() để bắt dính mọi định dạng đường dẫn (có hoặc không có /ppt/)
-                        if (target && target.includes(slideFileName)) {
-                            rIdToRemove = rels[i].getAttribute("Id");
-                            rels[i].parentNode.removeChild(rels[i]); // Xóa khỏi file rels
+                    for (let rel of rels) {
+                        let target = rel.getAttribute("Target");
+                        // Bắt chính xác tên file ở đuôi chuỗi để không bị nhầm (vd: slide1.xml và slide11.xml)
+                        if (target && (target.endsWith(`/${slideFileName}`) || target === slideFileName)) {
+                            rIdToRemove = rel.getAttribute("Id");
+                            rel.parentNode.removeChild(rel); 
                             break;
                         }
                     }
 
-                    // b. Xóa thẻ <p:sldId> trong presentation.xml dựa vào rId
+                    // b. Xóa thẻ <p:sldId> trong presentation.xml (Lý do gây ra trang trắng ở giữa)
                     if (rIdToRemove) {
-                        let sldIds = presDoc.getElementsByTagName("p:sldId");
-                        // Bắt thêm trường hợp trình duyệt ẩn namespace (p:)
-                        if (sldIds.length === 0) sldIds = presDoc.getElementsByTagNameNS("*", "sldId");
-
-                        for (let i = 0; i < sldIds.length; i++) {
-                            let rId = sldIds[i].getAttribute("r:id") || sldIds[i].getAttribute("id");
-                            if (rId === rIdToRemove) {
-                                sldIds[i].parentNode.removeChild(sldIds[i]);
+                        let sldIds = Array.from(presDoc.getElementsByTagName("p:sldId"));
+                        if (sldIds.length === 0) sldIds = Array.from(presDoc.getElementsByTagNameNS("*", "sldId"));
+                        
+                        for (let sldId of sldIds) {
+                            let matchFound = false;
+                            // Quét mọi thuộc tính, nếu giá trị trùng khớp rId thì đích thị là nó
+                            for (let attr of sldId.attributes) {
+                                if (attr.value === rIdToRemove) {
+                                    matchFound = true;
+                                    break;
+                                }
+                            }
+                            if (matchFound) {
+                                sldId.parentNode.removeChild(sldId);
                                 break;
                             }
                         }
                     }
 
                     // c. Xóa khai báo trong [Content_Types].xml
-                    let overrides = contentTypesDoc.getElementsByTagName("Override");
-                    if (overrides.length === 0) overrides = contentTypesDoc.getElementsByTagNameNS("*", "Override");
-
-                    for (let i = 0; i < overrides.length; i++) {
-                        let partName = overrides[i].getAttribute("PartName");
+                    let overrides = Array.from(contentTypesDoc.getElementsByTagName("Override"));
+                    if (overrides.length === 0) overrides = Array.from(contentTypesDoc.getElementsByTagNameNS("*", "Override"));
+                    
+                    for (let override of overrides) {
+                        let partName = override.getAttribute("PartName");
                         if (partName && partName.includes(slideFileName)) {
-                            overrides[i].parentNode.removeChild(overrides[i]);
+                            override.parentNode.removeChild(override);
                             break;
                         }
                     }
 
-                    // d. Xóa file vật lý khỏi cục ZIP
+                    // d. Xóa file vật lý khỏi bộ nhớ RAM (file ZIP)
                     zip.remove(slidePath);
                     zip.remove(`ppt/slides/_rels/${slideFileName}.rels`);
+
                 } else {
                     // ==========================================
-                    // LOGIC GIỮ ẢNH, XÓA CHỮ (SLIDE CÓ ẢNH)
+                    // BƯỚC 2B: CÓ ẢNH -> XÓA CHỮ, GIỮ LẠI ẢNH VÀ ÉP NỀN TRẮNG
                     // ==========================================
 
-                    // Xóa các TextBox và Shape chứa chữ (<p:sp>)
+                    // 1. Xóa các Shape chữ NHƯNG chừa lại Shape chứa ảnh
                     let shapes = Array.from(slideDoc.getElementsByTagName("p:sp"));
-                    shapes.forEach(shape => shape.parentNode.removeChild(shape));
+                    if (shapes.length === 0) shapes = Array.from(slideDoc.getElementsByTagNameNS("*", "sp"));
 
-                    // Xóa các Biểu đồ, Bảng biểu (<p:graphicFrame>)
+                    shapes.forEach(shape => {
+                        // Kiểm tra xem shape có chứa hình ảnh (a:blipFill) không
+                        let hasImageFill = shape.getElementsByTagName("a:blipFill").length > 0 ||
+                            shape.getElementsByTagNameNS("*", "blipFill").length > 0;
+                        if (!hasImageFill) {
+                            shape.parentNode.removeChild(shape); // Xóa nếu chỉ là text/khối màu
+                        }
+                    });
+
+                    // 2. Xóa các Biểu đồ, Bảng biểu (<p:graphicFrame>)
                     let graphics = Array.from(slideDoc.getElementsByTagName("p:graphicFrame"));
-                    graphics.forEach(graphic => graphic.parentNode.removeChild(graphic));
+                    if (graphics.length === 0) graphics = Array.from(slideDoc.getElementsByTagNameNS("*", "graphicFrame"));
+                    graphics.forEach(g => g.parentNode.removeChild(g));
 
-                    // Xóa các Đường kẻ nối (<p:cxnSp>)
+                    // 3. Xóa các Đường kẻ nối (<p:cxnSp>)
                     let connectors = Array.from(slideDoc.getElementsByTagName("p:cxnSp"));
-                    connectors.forEach(conn => conn.parentNode.removeChild(conn));
+                    if (connectors.length === 0) connectors = Array.from(slideDoc.getElementsByTagNameNS("*", "cxnSp"));
+                    connectors.forEach(c => c.parentNode.removeChild(c));
 
-                    // Xóa các nét vẽ bằng bút (Ink)
+                    // 4. Xóa các nét vẽ bằng bút (Ink)
                     let inks = Array.from(slideDoc.getElementsByTagName("p:ink"));
-                    // Dự phòng cho trường hợp trình duyệt parse namespace khác
                     if (inks.length === 0) inks = Array.from(slideDoc.getElementsByTagNameNS("*", "ink"));
                     inks.forEach(ink => ink.parentNode.removeChild(ink));
 
-                    // 1. Tắt hiển thị các họa tiết, logo từ Slide Master cũ
+                    // 5. Tắt họa tiết Master Slide và Ép nền trắng (FFFFFFF)
                     slideDoc.documentElement.setAttribute("showMasterSp", "0");
-
-                    // 2. Tạo một đoạn XML định nghĩa nền màu trắng (FFFFFF)
                     let whiteBgXml = `
-                <p:bg xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
-                    <p:bgPr>
-                        <a:solidFill>
-                            <a:srgbClr val="FFFFFF"/>
-                        </a:solidFill>
-                        <a:effectLst/>
-                    </p:bgPr>
-                </p:bg>`;
-
-                    // Parse chuỗi XML thành Node và import vào Document hiện tại
+                    <p:bg xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+                        <p:bgPr>
+                            <a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>
+                            <a:effectLst/>
+                        </p:bgPr>
+                    </p:bg>`;
                     let newBgDoc = parser.parseFromString(whiteBgXml, "application/xml");
                     let importedBgNode = slideDoc.importNode(newBgDoc.documentElement, true);
 
-                    // Tìm thẻ <p:cSld> (chứa nội dung lõi của slide)
                     let cSld = slideDoc.getElementsByTagName("p:cSld")[0];
                     if (!cSld) cSld = slideDoc.getElementsByTagNameNS("*", "cSld")[0];
 
                     if (cSld) {
-                        // Xóa thẻ nền cũ của slide (nếu có)
                         let oldBg = cSld.getElementsByTagName("p:bg")[0];
                         if (!oldBg) oldBg = cSld.getElementsByTagNameNS("*", "bg")[0];
-
-                        if (oldBg) {
-                            cSld.removeChild(oldBg);
-                        }
-
-                        // Chèn thẻ nền trắng lên đầu tiên bên trong <p:cSld>
+                        if (oldBg) cSld.removeChild(oldBg);
                         cSld.insertBefore(importedBgNode, cSld.firstChild);
                     }
 
-                    // Ghi đè file XML của slide này bằng nội dung đã dọn dẹp
+                    // Ghi đè file XML
                     let updatedSlideXml = serializer.serializeToString(slideDoc);
                     zip.file(slidePath, updatedSlideXml);
                 }
@@ -394,7 +421,7 @@
                     // Thêm tiền tố để phân biệt với file gốc
                     a.download = `Images_${file.name}`;
                     a.className = 'download-btn';
-                    a.textContent = `Tải về: ImagesOnly_${file.name}`;
+                    a.textContent = `Tải về: Images_${file.name}`;
                     downloadLinksContainer.appendChild(a);
                 }
 
