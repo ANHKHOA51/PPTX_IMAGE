@@ -217,112 +217,161 @@
             resultArea.style.display = 'none';
         });
 
-        // 2. Hàm lõi: Bóc tách hình ảnh và tạo file PPTX mới
+        // Chỉ cần dùng JSZip, KHÔNG cần PptxGenJS nữa
         async function processSingleFile(file) {
             const zip = new JSZip();
             const arrayBuffer = await file.arrayBuffer();
             await zip.loadAsync(arrayBuffer);
-
-            const newPptx = new PptxGenJS();
-            // Chỉnh lại Layout chuẩn (Fix lỗi UNKNOWN-LAYOUT)
-            newPptx.layout = 'LAYOUT_16x9';
-
             const parser = new DOMParser();
+            const serializer = new XMLSerializer();
 
-            // Sắp xếp slide đúng thứ tự 1, 2, 3...
-            const slideFiles = Object.keys(zip.files).filter(name =>
-                name.match(/^ppt\/slides\/slide\d+\.xml$/)
-            ).sort((a, b) => {
-                return parseInt(a.match(/\d+/)[0]) - parseInt(b.match(/\d+/)[0]);
-            });
+            // 1. Đọc các file cấu trúc lõi của PPTX để chuẩn bị cho việc xóa slide
+            let presXmlStr = await zip.file("ppt/presentation.xml").async("string");
+            let presDoc = parser.parseFromString(presXmlStr, "application/xml");
+
+            let presRelsStr = await zip.file("ppt/_rels/presentation.xml.rels").async("string");
+            let presRelsDoc = parser.parseFromString(presRelsStr, "application/xml");
+
+            let contentTypesStr = await zip.file("[Content_Types].xml").async("string");
+            let contentTypesDoc = parser.parseFromString(contentTypesStr, "application/xml");
+
+            // Lấy danh sách tất cả các slide
+            const slideFiles = Object.keys(zip.files).filter(name => name.match(/^ppt\/slides\/slide\d+\.xml$/));
 
             for (let slidePath of slideFiles) {
-                let slideNum = slidePath.match(/slide(\d+)\.xml/)[1];
+                let slideFileName = slidePath.split('/').pop(); // ví dụ: slide1.xml
+
                 let slideXmlStr = await zip.file(slidePath).async("string");
                 let slideDoc = parser.parseFromString(slideXmlStr, "application/xml");
 
-                let relsPath = `ppt/slides/_rels/slide${slideNum}.xml.rels`;
-                let relsDoc = null;
-                if (zip.file(relsPath)) {
-                    let relsXmlStr = await zip.file(relsPath).async("string");
-                    relsDoc = parser.parseFromString(relsXmlStr, "application/xml");
-                }
-
-                // CÁCH TÌM ẢNH MỚI: Tìm tất cả các thẻ có chứa "blip" (thẻ định nghĩa ảnh gốc)
-                // Cách này sẽ bắt được cả ảnh trong p:pic, ảnh nền, và ảnh trong group
+                // Tìm ảnh trong slide
                 let blipNodes = slideDoc.getElementsByTagNameNS("*", "blip");
-                if (blipNodes.length === 0) blipNodes = slideDoc.getElementsByTagName("a:blip"); // Fallback
+                if (blipNodes.length === 0) blipNodes = slideDoc.getElementsByTagName("a:blip");
 
-                // FIX 1: Nếu slide không có ảnh nào -> Bỏ qua, không tạo slide mới
-                if (blipNodes.length === 0) continue;
+                if (blipNodes.length === 0) {
+                    // ==========================================
+                    // LOGIC XÓA BỎ SLIDE TRỐNG TẬN GỐC (BẢN CẬP NHẬT)
+                    // ==========================================
 
-                // Chỉ khi có ảnh mới tạo slide mới
-                let newSlide = newPptx.addSlide();
+                    // a. Tìm Relationship ID (rId) của slide này trong presentation.xml.rels
+                    let rels = presRelsDoc.getElementsByTagName("Relationship");
+                    if (rels.length === 0) rels = presRelsDoc.getElementsByTagNameNS("*", "Relationship");
 
-                for (let i = 0; i < blipNodes.length; i++) {
-                    let blip = blipNodes[i];
-                    let embedId = blip.getAttribute("r:embed");
-                    if (!embedId) continue;
-
-                    // Truy ngược lên để tìm thẻ chứa tọa độ (a:off) và kích thước (a:ext)
-                    // Thường nó nằm ở node cha hoặc anh em gần đó.
-                    let picNode = blip.parentNode;
-                    while (picNode && picNode.nodeName.indexOf("pic") === -1 && picNode.nodeName !== "p:bg") {
-                        picNode = picNode.parentNode;
-                    }
-
-                    let x = 0, y = 0, w = 4, h = 3; // Kích thước mặc định fallback
-
-                    if (picNode) {
-                        let xfrm = picNode.getElementsByTagNameNS("*", "xfrm")[0] || picNode.getElementsByTagName("a:xfrm")[0];
-                        if (xfrm) {
-                            let off = xfrm.getElementsByTagNameNS("*", "off")[0] || xfrm.getElementsByTagName("a:off")[0];
-                            let ext = xfrm.getElementsByTagNameNS("*", "ext")[0] || xfrm.getElementsByTagName("a:ext")[0];
-
-                            if (off && ext) {
-                                // FIX 3: Quy đổi chính xác từ EMU sang Inch (1 Inch = 914400 EMU)
-                                x = parseInt(off.getAttribute("x") || 0) / 914400;
-                                y = parseInt(off.getAttribute("y") || 0) / 914400;
-                                w = parseInt(ext.getAttribute("cx") || 0) / 914400;
-                                h = parseInt(ext.getAttribute("cy") || 0) / 914400;
-                            }
+                    let rIdToRemove = null;
+                    for (let i = 0; i < rels.length; i++) {
+                        let target = rels[i].getAttribute("Target");
+                        // Dùng .includes() để bắt dính mọi định dạng đường dẫn (có hoặc không có /ppt/)
+                        if (target && target.includes(slideFileName)) {
+                            rIdToRemove = rels[i].getAttribute("Id");
+                            rels[i].parentNode.removeChild(rels[i]); // Xóa khỏi file rels
+                            break;
                         }
                     }
 
-                    // Đối chiếu ID để lấy ảnh từ file .rels
-                    if (relsDoc) {
-                        let relationships = relsDoc.getElementsByTagName("Relationship");
-                        let imagePathInZip = null;
+                    // b. Xóa thẻ <p:sldId> trong presentation.xml dựa vào rId
+                    if (rIdToRemove) {
+                        let sldIds = presDoc.getElementsByTagName("p:sldId");
+                        // Bắt thêm trường hợp trình duyệt ẩn namespace (p:)
+                        if (sldIds.length === 0) sldIds = presDoc.getElementsByTagNameNS("*", "sldId");
 
-                        for (let j = 0; j < relationships.length; j++) {
-                            if (relationships[j].getAttribute("Id") === embedId) {
-                                let target = relationships[j].getAttribute("Target");
-                                imagePathInZip = target.replace('../', 'ppt/');
+                        for (let i = 0; i < sldIds.length; i++) {
+                            let rId = sldIds[i].getAttribute("r:id") || sldIds[i].getAttribute("id");
+                            if (rId === rIdToRemove) {
+                                sldIds[i].parentNode.removeChild(sldIds[i]);
                                 break;
                             }
                         }
+                    }
 
-                        if (imagePathInZip && zip.file(imagePathInZip)) {
-                            let extMatch = imagePathInZip.match(/\.([^.]+)$/);
-                            let imgExt = extMatch ? extMatch[1].toLowerCase() : 'png';
+                    // c. Xóa khai báo trong [Content_Types].xml
+                    let overrides = contentTypesDoc.getElementsByTagName("Override");
+                    if (overrides.length === 0) overrides = contentTypesDoc.getElementsByTagNameNS("*", "Override");
 
-                            // Xử lý một số định dạng ngoại lệ
-                            if (imgExt === 'jpeg') imgExt = 'jpg';
-
-                            let base64Data = await zip.file(imagePathInZip).async("base64");
-                            let dataUrl = `image/${imgExt};base64,${base64Data}`;
-
-                            // Thêm ảnh vào slide với tọa độ vừa bóc
-                            newSlide.addImage({
-                                data: dataUrl,
-                                x: x, y: y, w: w, h: h
-                            });
+                    for (let i = 0; i < overrides.length; i++) {
+                        let partName = overrides[i].getAttribute("PartName");
+                        if (partName && partName.includes(slideFileName)) {
+                            overrides[i].parentNode.removeChild(overrides[i]);
+                            break;
                         }
                     }
+
+                    // d. Xóa file vật lý khỏi cục ZIP
+                    zip.remove(slidePath);
+                    zip.remove(`ppt/slides/_rels/${slideFileName}.rels`);
+                } else {
+                    // ==========================================
+                    // LOGIC GIỮ ẢNH, XÓA CHỮ (SLIDE CÓ ẢNH)
+                    // ==========================================
+
+                    // Xóa các TextBox và Shape chứa chữ (<p:sp>)
+                    let shapes = Array.from(slideDoc.getElementsByTagName("p:sp"));
+                    shapes.forEach(shape => shape.parentNode.removeChild(shape));
+
+                    // Xóa các Biểu đồ, Bảng biểu (<p:graphicFrame>)
+                    let graphics = Array.from(slideDoc.getElementsByTagName("p:graphicFrame"));
+                    graphics.forEach(graphic => graphic.parentNode.removeChild(graphic));
+
+                    // Xóa các Đường kẻ nối (<p:cxnSp>)
+                    let connectors = Array.from(slideDoc.getElementsByTagName("p:cxnSp"));
+                    connectors.forEach(conn => conn.parentNode.removeChild(conn));
+
+                    // Xóa các nét vẽ bằng bút (Ink)
+                    let inks = Array.from(slideDoc.getElementsByTagName("p:ink"));
+                    // Dự phòng cho trường hợp trình duyệt parse namespace khác
+                    if (inks.length === 0) inks = Array.from(slideDoc.getElementsByTagNameNS("*", "ink"));
+                    inks.forEach(ink => ink.parentNode.removeChild(ink));
+
+                    // 1. Tắt hiển thị các họa tiết, logo từ Slide Master cũ
+                    slideDoc.documentElement.setAttribute("showMasterSp", "0");
+
+                    // 2. Tạo một đoạn XML định nghĩa nền màu trắng (FFFFFF)
+                    let whiteBgXml = `
+                <p:bg xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+                    <p:bgPr>
+                        <a:solidFill>
+                            <a:srgbClr val="FFFFFF"/>
+                        </a:solidFill>
+                        <a:effectLst/>
+                    </p:bgPr>
+                </p:bg>`;
+
+                    // Parse chuỗi XML thành Node và import vào Document hiện tại
+                    let newBgDoc = parser.parseFromString(whiteBgXml, "application/xml");
+                    let importedBgNode = slideDoc.importNode(newBgDoc.documentElement, true);
+
+                    // Tìm thẻ <p:cSld> (chứa nội dung lõi của slide)
+                    let cSld = slideDoc.getElementsByTagName("p:cSld")[0];
+                    if (!cSld) cSld = slideDoc.getElementsByTagNameNS("*", "cSld")[0];
+
+                    if (cSld) {
+                        // Xóa thẻ nền cũ của slide (nếu có)
+                        let oldBg = cSld.getElementsByTagName("p:bg")[0];
+                        if (!oldBg) oldBg = cSld.getElementsByTagNameNS("*", "bg")[0];
+
+                        if (oldBg) {
+                            cSld.removeChild(oldBg);
+                        }
+
+                        // Chèn thẻ nền trắng lên đầu tiên bên trong <p:cSld>
+                        cSld.insertBefore(importedBgNode, cSld.firstChild);
+                    }
+
+                    // Ghi đè file XML của slide này bằng nội dung đã dọn dẹp
+                    let updatedSlideXml = serializer.serializeToString(slideDoc);
+                    zip.file(slidePath, updatedSlideXml);
                 }
             }
 
-            return await newPptx.write({ outputType: 'blob' });
+            // 2. Ghi đè các file hệ thống đã được cập nhật (sau khi xóa slide trống)
+            zip.file("ppt/presentation.xml", serializer.serializeToString(presDoc));
+            zip.file("ppt/_rels/presentation.xml.rels", serializer.serializeToString(presRelsDoc));
+            zip.file("[Content_Types].xml", serializer.serializeToString(contentTypesDoc));
+
+            // 3. Xuất file mới
+            return await zip.generateAsync({
+                type: "blob",
+                mimeType: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            });
         }
 
         // 3. Xử lý khi bấm nút
@@ -343,7 +392,7 @@
                     const a = document.createElement('a');
                     a.href = url;
                     // Thêm tiền tố để phân biệt với file gốc
-                    a.download = `ImagesOnly_${file.name}`;
+                    a.download = `Images_${file.name}`;
                     a.className = 'download-btn';
                     a.textContent = `Tải về: ImagesOnly_${file.name}`;
                     downloadLinksContainer.appendChild(a);
