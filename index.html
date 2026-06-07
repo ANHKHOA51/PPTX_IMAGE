@@ -321,8 +321,7 @@
             }
 
             function cleanSlideContent(slideDoc) {
-                // Chỉ sử dụng logic Black-list (tìm đúng đồ thừa thì xóa), để tránh xóa nhầm Shape chứa ảnh
-
+                // 1. Xóa các Shape chữ (chừa lại Shape được bọc ảnh)
                 const shapes = Array.from(slideDoc.getElementsByTagNameNS("*", "sp"));
                 for (const shape of shapes) {
                     const hasPic = shape.getElementsByTagNameNS("*", "blipFill").length > 0;
@@ -331,31 +330,52 @@
                     }
                 }
 
+                // 2. XÓA BẢNG BIỂU VÀ BIỂU ĐỒ (Đã fix triệt để)
                 const graphicFrames = Array.from(slideDoc.getElementsByTagNameNS("*", "graphicFrame"));
                 for (const g of graphicFrames) {
-                    // Kiểm tra xem bên trong có chứa ảnh OLE (Word/Excel) không
-                    const hasPic = g.getElementsByTagNameNS("*", "blip").length > 0;
-                    if (!hasPic) {
+                    const graphicData = g.getElementsByTagNameNS("*", "graphicData")[0];
+                    let isTableOrChart = false;
+
+                    // Kiểm tra danh tính thực sự của cục Graphic này
+                    if (graphicData) {
+                        const uri = graphicData.getAttribute("uri") || "";
+                        // Nếu đích thị là Table hoặc Chart
+                        if (uri.includes("table") || uri.includes("chart")) {
+                            isTableOrChart = true;
+                        }
+                    }
+
+                    if (isTableOrChart) {
+                        // Là Bảng/Biểu đồ thì xóa ngay không cần hỏi
                         g.parentNode && g.parentNode.removeChild(g);
+                    } else {
+                        // Là SmartArt thì nương tay kiểm tra xem có "ảnh thật" bên trong không
+                        const hasPic = g.getElementsByTagNameNS("*", "blip").length > 0;
+                        if (!hasPic) {
+                            g.parentNode && g.parentNode.removeChild(g);
+                        }
                     }
                 }
 
+                // 3. Xóa các Đường kẻ nối (Mũi tên...)
                 const connectors = Array.from(slideDoc.getElementsByTagNameNS("*", "cxnSp"));
                 for (const c of connectors) {
                     c.parentNode && c.parentNode.removeChild(c);
                 }
 
+                // 4. Xóa nét bút vẽ lúc thuyết trình
                 const inks = Array.from(slideDoc.getElementsByTagNameNS("*", "ink"));
                 for (const ink of inks) {
                     ink.parentNode && ink.parentNode.removeChild(ink);
                 }
 
+                // 5. Xóa các file đính kèm (VD: Bảng Excel nhúng dạng OLE)
                 const oleObjs = Array.from(slideDoc.getElementsByTagNameNS("*", "oleObj"));
                 for (const o of oleObjs) {
                     o.parentNode && o.parentNode.removeChild(o);
                 }
 
-                // Cuối cùng là ẩn master và ép nền trắng
+                // 6. Ẩn master template và ép nền trắng
                 hideMasterAndWhiteSlide(slideDoc);
             }
 
