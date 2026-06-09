@@ -188,6 +188,12 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/gitbrent/PptxGenJS@3.12.0/dist/pptxgen.bundle.js"></script>
 
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+    <script>
+        // Cấu hình worker cho PDF.js
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+    </script>
+
     <script>
         const fileInput = document.getElementById('fileInput');
         const fileListContainer = document.getElementById('file-list');
@@ -216,6 +222,108 @@
             }
             resultArea.style.display = 'none';
         });
+
+        // =================================================================
+        // HÀM XỬ LÝ PDF (MỚI THÊM)
+        // =================================================================
+        async function processPdfToPptx(file) {
+            const arrayBuffer = await file.arrayBuffer();
+            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+            const pptx = new PptxGenJS();
+            pptx.layout = 'LAYOUT_16x9';
+            let slidesAdded = 0;
+
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+                const operatorList = await page.getOperatorList();
+                let extractedImages = [];
+
+                for (let i = 0; i < operatorList.fnArray.length; i++) {
+                    const fn = operatorList.fnArray[i];
+                    if (fn === pdfjsLib.OPS.paintImageXObject || fn === pdfjsLib.OPS.paintJpegXObject) {
+                        const imgId = operatorList.argsArray[i][0];
+
+                        try {
+                            const imgObj = await new Promise(resolve => {
+                                page.objs.get(imgId, (img) => resolve(img));
+                            });
+
+                            if (imgObj) {
+                                const canvas = document.createElement('canvas');
+                                canvas.width = imgObj.width;
+                                canvas.height = imgObj.height;
+                                const ctx = canvas.getContext('2d');
+                                const imgData = ctx.createImageData(imgObj.width, imgObj.height);
+
+                                const numPixels = imgObj.width * imgObj.height;
+                                const dataLength = imgObj.data.length;
+
+                                // --- LOGIC CHUYỂN ĐỔI HỆ MÀU ---
+
+                                // 1. Trường hợp Grayscale (1 byte mỗi pixel)
+                                if (dataLength === numPixels) {
+                                    for (let k = 0, j = 0; k < dataLength; k++, j += 4) {
+                                        const gray = imgObj.data[k];
+                                        imgData.data[j] = gray;     // R
+                                        imgData.data[j + 1] = gray; // G
+                                        imgData.data[j + 2] = gray; // B
+                                        imgData.data[j + 3] = 255;  // A (Opaque)
+                                    }
+                                }
+                                // 2. Trường hợp RGB (3 byte mỗi pixel - như cũ)
+                                else if (dataLength === numPixels * 3) {
+                                    for (let k = 0, j = 0; k < dataLength; k += 3, j += 4) {
+                                        imgData.data[j] = imgObj.data[k];         // R
+                                        imgData.data[j + 1] = imgObj.data[k + 1]; // G
+                                        imgData.data[j + 2] = imgObj.data[k + 2]; // B
+                                        imgData.data[j + 3] = 255;                // A
+                                    }
+                                }
+                                // 3. Trường hợp RGBA (4 byte mỗi pixel) hoặc khác
+                                else if (dataLength === numPixels * 4) {
+                                    imgData.data.set(imgObj.data);
+                                }
+                                // Nếu không rơi vào các trường hợp trên, cố gắng copy tối đa có thể
+                                else {
+                                    // Fallback an toàn để không bị sập app
+                                    const limit = Math.min(dataLength, imgData.data.length);
+                                    for (let k = 0; k < limit; k++) {
+                                        imgData.data[k] = imgObj.data[k];
+                                    }
+                                }
+
+                                ctx.putImageData(imgData, 0, 0);
+                                extractedImages.push(canvas.toDataURL('image/png'));
+                            }
+                        } catch (e) {
+                            console.warn(`Lỗi bóc ảnh trang ${pageNum}:`, e);
+                        }
+                    }
+                }
+
+                if (extractedImages.length > 0) {
+                    let slide = pptx.addSlide();
+                    slidesAdded++;
+                    extractedImages.forEach((base64Data, idx) => {
+                        let offset = (idx * 0.2) % 2;
+                        slide.addImage({
+                            data: base64Data,
+                            x: 0.5 + offset,
+                            y: 0.5 + offset,
+                            sizing: { type: 'contain', w: 8.5, h: 4.5 }
+                        });
+                    });
+                }
+            }
+
+            if (slidesAdded === 0) {
+                let slide = pptx.addSlide();
+                slide.addText("PDF không có ảnh hoặc định dạng ảnh không hỗ trợ.", { x: 1, y: 2, w: "80%", align: "center" });
+            }
+
+            return await pptx.write({ outputType: 'blob' });
+        }
 
         // Chỉ cần dùng JSZip, KHÔNG cần PptxGenJS nữa
         async function processSingleFile(file) {
@@ -517,18 +625,26 @@
             try {
                 for (let i = 0; i < selectedFiles.length; i++) {
                     let file = selectedFiles[i];
+                    let resultBlob;
+                    let fileName;
 
-                    // Gọi hàm bóc tách cho từng file
-                    let resultBlob = await processSingleFile(file);
+                    // Kiểm tra đuôi file để phân luồng
+                    if (file.name.toLowerCase().endsWith('.pdf')) {
+                        resultBlob = await processPdfToPptx(file);
+                        // Đổi tên đuôi file kết quả thành .pptx
+                        fileName = file.name.replace(/\.[^/.]+$/, "") + ".pptx";
+                    } else {
+                        resultBlob = await processSingleFile(file);
+                        fileName = file.name;
+                    }
 
                     // Tạo link download
                     const url = URL.createObjectURL(resultBlob);
                     const a = document.createElement('a');
                     a.href = url;
-                    // Thêm tiền tố để phân biệt với file gốc
-                    a.download = `Images_${file.name}`;
+                    a.download = `Images_${fileName}`;
                     a.className = 'download-btn';
-                    a.textContent = `Tải về: Images_${file.name}`;
+                    a.textContent = `Tải về: Images_${fileName}`;
                     downloadLinksContainer.appendChild(a);
                 }
 
@@ -536,7 +652,7 @@
 
             } catch (error) {
                 console.error("Lỗi:", error);
-                alert("Có lỗi xảy ra trong quá trình bóc tách hình ảnh!");
+                alert("Có lỗi xảy ra trong quá trình xử lý!");
             } finally {
                 processBtn.textContent = 'Xử lý File';
                 processBtn.disabled = false;
